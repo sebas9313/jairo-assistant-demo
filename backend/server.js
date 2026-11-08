@@ -20,6 +20,26 @@ async function init(){
  CREATE TABLE IF NOT EXISTS family_audit(id bigserial PRIMARY KEY,record_id uuid NOT NULL,actor_id uuid NOT NULL REFERENCES family_users(id),action text NOT NULL,before jsonb,after jsonb,at timestamptz NOT NULL DEFAULT now());`);
  const adminEmail=process.env.INITIAL_ADMIN_EMAIL?.trim().toLowerCase(),adminPassword=process.env.INITIAL_ADMIN_PASSWORD;
  if(adminEmail&&adminPassword){if(adminPassword.length<12)throw Error('Initial password must be at least 12 characters');const count=await q('SELECT count(*)::int AS n FROM family_users');if(count.rows[0].n===0){await q('INSERT INTO family_users(id,name,email,password_hash) VALUES($1,$2,$3,$4)',[randomUUID(),process.env.INITIAL_ADMIN_NAME||'Administrador',adminEmail,await passwordHash(adminPassword)]);console.log('Initial admin created')} }
+ const recoveryKey=process.env.ADMIN_RECOVERY_ONCE;
+ if(recoveryKey){
+  if(recoveryKey.length<24||!adminEmail||!adminPassword||adminPassword.length<12)throw Error('Recovery requires ADMIN_RECOVERY_ONCE (24+ characters) and valid INITIAL_ADMIN_EMAIL / INITIAL_ADMIN_PASSWORD');
+  const client=await pool.connect();
+  try{
+   await client.query('BEGIN');
+   await client.query('CREATE TABLE IF NOT EXISTS admin_recovery_used(key_hash text PRIMARY KEY,used_at timestamptz NOT NULL DEFAULT now())');
+   await client.query('LOCK TABLE admin_recovery_used IN EXCLUSIVE MODE');
+   const used=await client.query('SELECT 1 FROM admin_recovery_used WHERE key_hash=$1',[hash(recoveryKey)]);
+   if(!used.rowCount){
+    const users=await client.query('SELECT id FROM family_users');
+    if(users.rowCount!==1)throw Error('Admin recovery only allowed when exactly one account exists');
+    await client.query('UPDATE family_users SET email=$1,password_hash=$2 WHERE id=$3',[adminEmail,await passwordHash(adminPassword),users.rows[0].id]);
+    await client.query('DELETE FROM family_sessions WHERE user_id=$1',[users.rows[0].id]);
+    await client.query('INSERT INTO admin_recovery_used(key_hash) VALUES($1)',[hash(recoveryKey)]);
+    console.log('One-time admin recovery completed');
+   }
+   await client.query('COMMIT');
+  }catch(e){await client.query('ROLLBACK');throw e}finally{client.release()}
+ }
 }
 const wrap=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next);
 const auth=wrap(async(req,res,next)=>{const token=/^Bearer ([a-f0-9]{64})$/.exec(req.headers.authorization||'')?.[1];if(!token)return res.sendStatus(401);const result=await q('SELECT u.id,u.name,u.email FROM family_sessions s JOIN family_users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>now()',[hash(token)]);if(!result.rowCount)return res.sendStatus(401);req.user=result.rows[0];next()});
